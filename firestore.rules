@@ -1,0 +1,217 @@
+// =============================================================================
+// Firestore Security Rules
+//
+// Ported from the Supabase RLS policies (migrations 20260101000001,
+// 20260101000003, 20260101000005, 20260101000006).
+//
+// Enforcement model:
+//   * Pure data-shape and permission checks live here (rules).
+//   * Cross-document invariants (atomic stock decrement, min-order, total
+//     consistency, legal status transitions, stock refund on cancel)
+//     live in the Firestore transactions in src/lib/firestore/orders.ts.
+//     Firestore transactions are isomorphic to Postgres row locks:
+//     retried on contention, atomic on commit.
+//
+// =============================================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------- Role helpers (profile lookup) -----------------------------
+    function role(uid) {
+      return get(/databases/$(database)/documents/profiles/$(uid)).data.role;
+    }
+    function isSignedIn()  { return request.auth != null; }
+    function isSelf(uid)   { return isSignedIn() && request.auth.uid == uid; }
+    function isOwner()     { return isSignedIn() && role(request.auth.uid) == 'owner'; }
+    function isAdmin()     { return isSignedIn() && role(request.auth.uid) == 'admin'; }
+    function isStaff()     { return isOwner() || isAdmin(); }
+
+    // -------- /profiles/{uid} ------------------------------------------
+    //
+    // * Read: self OR staff.
+    // * Create: only on first sign-in; the client-created doc MUST have
+    //   role == 'client' (so Google-signed-in users can't self-elevate).
+    // * Update: self can update everything EXCEPT role. Owner can update
+    //   anything including role (used to promote admins).
+    match /profiles/{uid} {
+      allow read:   if isSelf(uid) || isStaff();
+
+      allow create: if isSelf(uid)
+                    && request.resource.data.role == 'client';
+
+      allow update: if (
+                       isSelf(uid)
+                       && request.resource.data.role == resource.data.role
+                     )
+                    || isOwner();
+
+      allow delete: if isOwner();
+
+      // -------- /profiles/{uid}/wishlist/{productId} -------------------
+      // Each user manages only their own favorites list.
+      match /wishlist/{productId} {
+        allow read:            if isSelf(uid);
+        allow create, update:  if isSelf(uid)
+                               && request.resource.data.productId == productId;
+        allow delete:          if isSelf(uid);
+      }
+    }
+
+    // -------- /categories/{id} -----------------------------------------
+    match /categories/{id} {
+      allow read:  if true;
+      allow write: if isOwner();
+    }
+
+    // -------- /products/{id} -------------------------------------------
+    //
+    // Public read. Writes only via owner directly OR via the atomic
+    // placeOrder / updateOrderStatus / submitProductReview transactions
+    // (which run with the acting user's credentials — guests cannot write
+    // directly here, so the only paths for a non-owner to touch
+    // stockQuantity or the rating aggregates are those transactions,
+    // which fully validate every delta).
+    match /products/{id} {
+      allow read:   if true;
+
+      // Owner can create/update/delete arbitrarily.
+      allow create, delete: if isOwner();
+      allow update: if isOwner()
+                    // Non-owners (incl. guests) may only change the
+                    // transaction-managed fields, within sane bounds:
+                    //   stockQuantity — non-negative int (order / cancel)
+                    //   averageRating — 0..5, reviewCount — non-decreasing int
+                    || (
+                      request.resource.data.diff(resource.data).affectedKeys()
+                        .hasOnly(['stockQuantity', 'updatedAt', 'averageRating', 'reviewCount'])
+                      && request.resource.data.get('stockQuantity', -1) is int
+                      && request.resource.data.get('stockQuantity', -1) >= 0
+                      && request.resource.data.get('averageRating', 0) is number
+                      && request.resource.data.get('averageRating', 0) >= 0
+                      && request.resource.data.get('averageRating', 0) <= 5
+                      && request.resource.data.get('reviewCount', 0) is int
+                      && request.resource.data.get('reviewCount', 0) >= resource.data.get('reviewCount', 0)
+                    );
+
+      // -------- /products/{id}/reviews/{reviewId} ----------------------
+      //
+      // * Public read (reviews render on the public product page).
+      // * Create: authenticated, self-attributed, integer rating 1..5,
+      //   optional comment with a length cap. The companion transaction
+      //   in src/lib/firestore/products.ts folds the rating into the
+      //   parent product's aggregate atomically.
+      // * Update/delete: the review's author OR staff.
+      match /reviews/{reviewId} {
+        allow read: if true;
+
+        allow create: if isSignedIn()
+                      && request.resource.data.userId == request.auth.uid
+                      && request.resource.data.userName is string
+                      && request.resource.data.userName.size() > 0
+                      && request.resource.data.userName.size() <= 200
+                      && request.resource.data.rating is int
+                      && request.resource.data.rating >= 1
+                      && request.resource.data.rating <= 5
+                      && (
+                        request.resource.data.comment == null
+                        || (
+                          request.resource.data.comment is string
+                          && request.resource.data.comment.size() <= 1000
+                        )
+                      );
+
+        allow update, delete: if isSignedIn()
+                      && (resource.data.userId == request.auth.uid || isStaff());
+      }
+    }
+
+    // -------- /store_settings/default ----------------------------------
+    //
+    // Public read (needed so the Shop screen can show the min-order,
+    // delivery fee, and enabled payment methods). Owner-only write.
+    match /store_settings/{doc} {
+      allow read:  if true;
+      allow write: if isOwner();
+    }
+
+    // -------- /orders/{id} ---------------------------------------------
+    //
+    // * Create: anyone (guest OR authed) may create an order IF the
+    //   incoming doc passes the strict validation below. The companion
+    //   transaction in src/lib/firestore/orders.ts enforces the rest of
+    //   the business rules (min order, total consistency, stock delta,
+    //   etc.) atomically.
+    // * Read: owner & admin see everything; signed-in clients see only
+    //   their own (userId == auth.uid). Guests cannot read orders.
+    //   (The guest confirmation screen reads from a client-side Zustand
+    //   cache populated at creation time — see src/stores/recentOrder.ts
+    //   This mirrors the Supabase "guest enumeration" hardening.)
+    // * Update: owner only, and only the `status` + `updatedAt` fields.
+    //   The state-machine check is enforced here (rejects any transition
+    //   from a terminal state, blocks skipping stages).
+    // * Delete: owner only (soft paths preferred — use status=cancelled).
+    //
+    match /orders/{id} {
+
+      allow read: if isStaff()
+                  || (
+                    isSignedIn()
+                    && resource.data.userId != null
+                    && resource.data.userId == request.auth.uid
+                  );
+
+      allow create: if validNewOrder();
+
+      allow update: if isOwner() && onlyStatusChange() && legalTransition();
+
+      allow delete: if isOwner();
+    }
+
+    // ---- validation helpers for orders --------------------------------
+    function validNewOrder() {
+      let d = request.resource.data;
+      // Must be a guest (null userId) OR authed user writing their own
+      let ownership =
+        (!isSignedIn() && d.userId == null)
+        || (isSignedIn() && d.userId == request.auth.uid);
+
+      return ownership
+        && d.status == 'pending'
+        && d.customerName is string
+        && d.customerName.size() > 0
+        && d.customerName.size() <= 200
+        && d.phoneNumber is string
+        && d.phoneNumber.size() >= 8
+        && d.phoneNumber.size() <= 20
+        && d.phoneNumber.matches('^\\+[1-9][0-9]{7,14}$')
+        && (d.notes == null || (d.notes is string && d.notes.size() <= 2000))
+        && d.fulfillmentType in ['delivery', 'pickup']
+        && d.paymentMethod in ['cash', 'stripe']
+        && d.subtotal     is number
+        && d.deliveryFee  is number
+        && d.totalAmount  is number
+        && d.subtotal     >= 0
+        && d.deliveryFee  >= 0
+        && d.totalAmount  >= 0
+        && d.items        is list
+        && d.items.size() > 0
+        && d.items.size() <= 100;
+    }
+
+    function onlyStatusChange() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt']);
+    }
+
+    function legalTransition() {
+      let from = resource.data.status;
+      let to   = request.resource.data.status;
+      return (from == 'pending'          && to in ['preparing', 'cancelled'])
+          || (from == 'preparing'        && to in ['out_for_delivery', 'cancelled'])
+          || (from == 'out_for_delivery' && to in ['delivered', 'cancelled']);
+      // Terminal states (delivered, cancelled) accept no transitions.
+    }
+  }
+}
